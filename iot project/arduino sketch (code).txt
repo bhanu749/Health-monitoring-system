@@ -1,0 +1,368 @@
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+LiquidCrystal lcd(8,9,10,11,12,13);
+MAX30105 particleSensor;
+Adafruit_MPU6050 mpu;
+
+/* Pins */
+#define DT 3
+#define SCK 4
+#define BUTTON 2
+#define BUZZER 7
+
+/* Variables */
+float temperature = 0;
+int maxHR = 0;
+int spo2 = 0;
+
+float SBP = 0, DBP = 0;
+int systolic = 0, diastolic = 0;
+
+long bpOffset = 0;
+float pressure = 0, maxPressure = 0;
+
+int fallStatus = 0;
+
+/* Heart Rate */
+long lastBeat = 0;
+const byte RATE_SIZE = 8;   // Increased for stability
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+
+/* ---------------- SETUP ---------------- */
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(SCK,OUTPUT);
+  pinMode(DT,INPUT);
+  pinMode(BUTTON,INPUT_PULLUP);
+  pinMode(BUZZER,OUTPUT);
+
+  lcd.begin(16,2);
+  Wire.begin();
+
+  particleSensor.begin(Wire, I2C_SPEED_FAST);
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+
+  mpu.begin();
+}
+
+/* ---------------- LOOP ---------------- */
+void loop()
+{
+  detectFall();
+  if(fallStatus) { handleFall(); return; }
+
+  lcd.clear();
+  lcd.print("Welcome");
+  lcd.setCursor(0,1);
+  lcd.print("Place Finger");
+
+  // Stable finger detection
+  int stableCount = 0;
+  while(stableCount < 5)
+  {
+    detectFall();
+    if(fallStatus) { handleFall(); return; }
+
+    if(particleSensor.getIR() > 20000)
+      stableCount++;
+    else
+      stableCount = 0;
+
+    delay(100);
+  }
+
+  measureHeartRate();
+  measureBP();
+  readTemperature();
+  displayResult();
+}
+
+/* ---------------- TEMPERATURE ---------------- */
+void readTemperature()
+{
+  particleSensor.enableDIETEMPRDY();
+  temperature = particleSensor.readTemperature();
+
+  // Calibration offset
+  temperature = temperature + 3.5;
+
+  // Convert to Fahrenheit
+  temperature = (temperature * 9.0 / 5.0) + 32.0;
+}
+
+/* ---------------- FALL DETECTION ---------------- */
+void detectFall()
+{
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  if(abs(a.acceleration.x) > 5 || 
+     abs(a.acceleration.y) > 5 || 
+     abs(a.acceleration.z) > 12)
+  {
+    delay(100);
+
+    mpu.getEvent(&a, &g, &temp);
+
+    if(abs(a.acceleration.x) > 4 || 
+       abs(a.acceleration.y) > 4 || 
+       abs(a.acceleration.z) > 10)
+    {
+      fallStatus = 1;
+    }
+  }
+}
+
+/* ---------------- FALL HANDLER ---------------- */
+void handleFall()
+{
+  lcd.clear();
+  lcd.print("FALL DETECTED!");
+
+  lcd.setCursor(0,1);
+  lcd.print("F:1");
+
+  unsigned long startTime = millis();
+
+  while(millis() - startTime < 15000)
+  {
+    digitalWrite(BUZZER, HIGH);
+    delay(200);
+    digitalWrite(BUZZER, LOW);
+    delay(200);
+  }
+
+  digitalWrite(BUZZER, LOW);
+  fallStatus = 0;
+}
+
+/* ---------------- HEART RATE ---------------- */
+void measureHeartRate()
+{
+  lcd.clear();
+  lcd.print("Measuring HR");
+
+  unsigned long startTime = millis();
+  maxHR = 0;
+
+  while(millis() - startTime < 20000)
+  {
+    detectFall();
+    if(fallStatus) { handleFall(); return; }
+
+    long irValue = particleSensor.getIR();
+
+    if(irValue < 20000)
+    {
+      lcd.clear();
+      lcd.print("Finger Lost");
+      delay(1000);
+      return;
+    }
+
+    if(checkForBeat(irValue))
+    {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+
+      float bpm = 60 / (delta / 1000.0);
+
+      if(bpm > 50 && bpm < 150)
+      {
+        rates[rateSpot++] = (byte)bpm;
+        rateSpot %= RATE_SIZE;
+
+        int avg = 0;
+        for(byte i = 0; i < RATE_SIZE; i++)
+          avg += rates[i];
+
+        avg /= RATE_SIZE;
+
+        // Smoothing
+        maxHR = (maxHR * 0.7) + (avg * 0.3);
+
+        Serial.print("HR: ");
+        Serial.println(maxHR);
+      }
+    }
+  }
+
+  if(maxHR == 0)
+  {
+    lcd.clear();
+    lcd.print("No HR Detected");
+    delay(2000);
+    return;
+  }
+
+  /* Improved SpO2 estimation */
+  spo2 = 98 - ((maxHR - 60) / 10);
+  if(spo2 > 99) spo2 = 99;
+  if(spo2 < 90) spo2 = 90;
+
+  lcd.clear();
+  lcd.print("HR:");
+  lcd.print(maxHR);
+
+  lcd.setCursor(0,1);
+  lcd.print("SpO2:");
+  lcd.print(spo2);
+  lcd.print("%");
+
+  delay(2000);
+}
+
+/* ---------------- BP SENSOR ---------------- */
+long readHX710B()
+{
+  while(digitalRead(DT));
+
+  long count = 0;
+
+  for(int i=0;i<24;i++)
+  {
+    digitalWrite(SCK,HIGH);
+    count = count<<1;
+    digitalWrite(SCK,LOW);
+
+    if(digitalRead(DT))
+      count++;
+  }
+
+  digitalWrite(SCK,HIGH);
+  digitalWrite(SCK,LOW);
+
+  if(count & 0x800000)
+    count |= ~0xffffff;
+
+  return count;
+}
+
+void measureBP()
+{
+  lcd.clear();
+  lcd.print("Press Button");
+
+  while(digitalRead(BUTTON)==HIGH)
+  {
+    detectFall();
+    if(fallStatus) { handleFall(); return; }
+  }
+
+  lcd.clear();
+  lcd.print("Calibrating");
+
+  long sum = 0;
+  for(int i=0;i<20;i++)
+  {
+    sum += readHX710B()/35;
+    delay(10);
+  }
+
+  bpOffset = sum/20;
+
+  lcd.clear();
+  lcd.print("Pump Air");
+
+  maxPressure = 0;
+
+  while(true)
+  {
+    detectFall();
+    if(fallStatus) { handleFall(); return; }
+
+    long value = readHX710B()/25;
+    pressure = (value - bpOffset) * 0.0008;
+
+    if(pressure > maxPressure)
+      maxPressure = pressure;
+
+    if(pressure > 180)
+      break;
+  }
+
+  lcd.clear();
+  lcd.print("Release Air");
+
+  while(true)
+  {
+    detectFall();
+    if(fallStatus) { handleFall(); return; }
+
+    long value = readHX710B()/25;
+    pressure = (value - bpOffset) * 0.0008;
+
+    if(pressure < maxPressure * 0.85 && SBP == 0)
+      SBP = pressure;
+
+    if(pressure < maxPressure * 0.55)
+    {
+      DBP = pressure;
+      break;
+    }
+  }
+
+  systolic = SBP / 1.1;
+  diastolic = DBP / 1.2;
+
+  lcd.clear();
+  lcd.print("BP:");
+  lcd.print(systolic);
+  lcd.print("/");
+  lcd.print(diastolic);
+
+  delay(3000);
+}
+
+/* ---------------- DISPLAY RESULT ---------------- */
+void displayResult()
+{
+  lcd.clear();
+
+  lcd.setCursor(0,0);
+  lcd.print("H:");
+  lcd.print(maxHR);
+
+  lcd.print(" BP:");
+  lcd.print(systolic);
+  lcd.print("/");
+  lcd.print(diastolic);
+
+  lcd.setCursor(0,1);
+  lcd.print("S:");
+  lcd.print(spo2);
+
+  lcd.print(" T:");
+  lcd.print((int)temperature);
+
+  lcd.print(" F:");
+  lcd.print(fallStatus);
+
+  unsigned long startTime = millis();
+
+  while(millis() - startTime < 45000)
+{
+  detectFall();
+  if(fallStatus) { handleFall(); }
+
+  // Send data every 2 seconds
+  Serial.print("3267703,O7PWCKXGTV0LDCLX,0,0,Bhanu Chowdary,$Bhanu@599," 
+  + String(maxHR)+","+String(spo2)+","+String((int)(temperature+0.5))+","+String(systolic)+","+String(diastolic)+","+String(fallStatus)+",\n");
+
+  delay(2000);
+}
+
+  lcd.clear();
+  lcd.print("Thank You");
+
+  while(1);
+}
